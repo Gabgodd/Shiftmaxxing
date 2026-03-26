@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { apiRequest, queryClient } from "@/lib/queryClient";
+import { queryClient } from "@/lib/queryClient";
 import type { Agent, Shift } from "@shared/schema";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -109,6 +109,11 @@ function calcCoverage(
 }
 
 interface LeverState { activeStart: number; activeEnd: number; }
+interface AICommandResponse {
+  interpreted?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  message?: string;
+}
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function Dashboard() {
@@ -126,9 +131,38 @@ export default function Dashboard() {
   const [viewMode, setViewMode]       = useState<"clock" | "timeline">("clock");
   // Tooltip state for clock ring hover
   const [tooltipInfo, setTooltipInfo] = useState<{ agent: Agent; shift: Shift; x: number; y: number } | null>(null);
+  const [aiInput, setAiInput] = useState("");
+  const [aiResponse, setAiResponse] = useState<AICommandResponse | null>(null);
 
   const { data: agents = [] }    = useQuery<Agent[]>({ queryKey: ["/api/agents"] });
   const { data: allShifts = [] } = useQuery<Shift[]>({ queryKey: ["/api/shifts"] });
+
+  const aiCommandMutation = useMutation({
+    mutationFn: async (input: string) => {
+      const resp = await fetch("/api/ai-command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input,
+          accessCode: "manager-test-123",
+        }),
+      });
+
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data?.message ?? "AI command failed");
+      }
+      return data as AICommandResponse;
+    },
+    onSuccess: (data) => {
+      setAiResponse(data);
+      queryClient.invalidateQueries({ queryKey: ["/api/shifts"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/overtime"] });
+    },
+    onError: (err: any) => {
+      setAiResponse({ message: err?.message ?? "Failed to run AI command." });
+    },
+  });
 
   // Init visible
   useEffect(() => {
@@ -421,6 +455,14 @@ export default function Dashboard() {
               peakCoverageHour={peakCoverageHour}
               totalOvertimeHours={totalOvertimeHours}
               totalReleasedHours={totalReleasedHours}
+            />
+
+            <AIManagerPanel
+              value={aiInput}
+              onChange={setAiInput}
+              onRun={() => aiCommandMutation.mutate(aiInput)}
+              loading={aiCommandMutation.isPending}
+              response={aiResponse}
             />
           </div>
         </div>
@@ -1054,6 +1096,65 @@ function SummaryPanel({ agentSummaries, selectedDay, zeroCoverageHours, peakCove
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function AIManagerPanel({
+  value,
+  onChange,
+  onRun,
+  loading,
+  response,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onRun: () => void;
+  loading: boolean;
+  response: AICommandResponse | null;
+}) {
+  return (
+    <div className="border-t border-border p-3 bg-card/10 shrink-0 space-y-2">
+      <p className="text-[10px] text-muted-foreground uppercase tracking-wider font-medium">
+        AI Manager Command (Testing)
+      </p>
+      <div className="flex gap-2">
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="Ask or command anything..."
+          className="flex-1 h-8 rounded border border-border bg-background px-2 text-xs outline-none focus:ring-1 focus:ring-primary"
+          data-testid="ai-command-input"
+        />
+        <button
+          onClick={onRun}
+          disabled={loading || value.trim().length === 0}
+          className="h-8 px-3 rounded text-xs font-medium bg-primary text-primary-foreground disabled:opacity-50 disabled:cursor-not-allowed"
+          data-testid="ai-command-run"
+        >
+          {loading ? "Running..." : "Run"}
+        </button>
+      </div>
+
+      {response && (
+        <div className="rounded border border-border bg-background p-2 text-[10px] space-y-1 max-h-44 overflow-auto">
+          {response.message && (
+            <p className="text-red-400">{response.message}</p>
+          )}
+          {response.interpreted && (
+            <div>
+              <p className="text-muted-foreground mb-1">Interpreted</p>
+              <pre className="whitespace-pre-wrap break-words font-mono">{JSON.stringify(response.interpreted, null, 2)}</pre>
+            </div>
+          )}
+          {response.result && (
+            <div>
+              <p className="text-muted-foreground mt-1 mb-1">Result</p>
+              <pre className="whitespace-pre-wrap break-words font-mono">{JSON.stringify(response.result, null, 2)}</pre>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
