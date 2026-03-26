@@ -24,13 +24,18 @@ function polarToCartesian(cx: number, cy: number, r: number, angleDeg: number) {
 }
 
 function describeArc(cx: number, cy: number, r: number, startHour: number, endHour: number) {
-  const s = Math.max(0, Math.min(24, startHour));
-  const e = Math.max(0, Math.min(24, endHour));
-  if (s >= e) return "";
-  const sa = hourToAngle(s), ea = hourToAngle(e);
+  const s = norm24(startHour);
+  let e = norm24(endHour);
+  if (s === e) return "";
+  if (e <= s) e += 24; // overnight wrap
+
+  const sa = hourToAngle(s);
+  const ea = hourToAngle(e % 24);
   const p1 = polarToCartesian(cx, cy, r, sa);
   const p2 = polarToCartesian(cx, cy, r, ea);
-  const largeArc = (e - s) > 12 ? 1 : 0;
+  const span = e - s;
+  const largeArc = span > 12 ? 1 : 0;
+
   return `M ${p1.x} ${p1.y} A ${r} ${r} 0 ${largeArc} 1 ${p2.x} ${p2.y}`;
 }
 
@@ -47,24 +52,59 @@ function formatH(h: number) {
   return `${hh.toString().padStart(2, "0")}:${mm.toString().padStart(2, "0")}`;
 }
 
+// ── NEW helpers (A) ───────────────────────────────────────────────────────────
+function norm24(h: number) {
+  return ((h % 24) + 24) % 24;
+}
+
+function hoursBetweenUtc(startUtc: number, endUtc: number) {
+  const s = norm24(startUtc);
+  const e = norm24(endUtc);
+  return e >= s ? e - s : 24 - s + e;
+}
+
+function isHourInShift(hour: number, startUtc: number, endUtc: number) {
+  const h = norm24(hour);
+  const s = norm24(startUtc);
+  const e = norm24(endUtc);
+  if (s === e) return false;
+  if (e > s) return h >= s && h < e;
+  // overnight
+  return h >= s || h < e;
+}
+
 // ── Coverage calc ─────────────────────────────────────────────────────────────
 function calcCoverage(
-  agents: Agent[], shifts: Shift[], visible: Set<number>,
-  leverState: Record<number, LeverState>
+  agents: Agent[],
+  shifts: Shift[],
+  visible: Set<number>,
+  leverState: Record<number, LeverState>,
 ) {
   const slots = Array(24).fill(0);
+
+  const addInterval = (start: number, end: number) => {
+    const s = norm24(start);
+    let e = norm24(end);
+    if (s === e) return;
+    if (e <= s) e += 24; // overnight
+
+    for (let h = Math.floor(s); h < Math.ceil(e); h++) {
+      const hh = ((h % 24) + 24) % 24;
+      const overlap = Math.min(e, h + 1) - Math.max(s, h);
+      if (overlap > 0) slots[hh] += overlap;
+    }
+  };
+
   for (const agent of agents) {
     if (!visible.has(agent.id)) continue;
-    for (const shift of shifts.filter(s => s.agentId === agent.id)) {
+    for (const shift of shifts.filter((s) => s.agentId === agent.id)) {
       const ls = leverState[shift.id];
-      const start = Math.max(0, ls?.activeStart ?? shift.startUtc);
-      const end   = Math.min(24, ls?.activeEnd   ?? shift.endUtc);
-      for (let h = Math.floor(start); h < Math.ceil(end); h++) {
-        const overlap = Math.min(end, h + 1) - Math.max(start, h);
-        if (overlap > 0) slots[h] += overlap;
-      }
+      const start = ls?.activeStart ?? shift.startUtc;
+      const end = ls?.activeEnd ?? shift.endUtc;
+      addInterval(start, end);
     }
   }
+
   return slots;
 }
 
@@ -77,7 +117,8 @@ export default function Dashboard() {
     return (d === 0 || d === 6) ? 1 : d;
   };
 
-  const [selectedDay, setSelectedDay] = useState<number>(initDay);
+  const
+  [selectedDay, setSelectedDay] = useState<number>(initDay);
   const [visible, setVisible]         = useState<Set<number>>(new Set());
   const [highlighted, setHighlighted] = useState<number | null>(null);
   const [leverState, setLeverState]   = useState<Record<number, LeverState>>({});
@@ -130,9 +171,11 @@ export default function Dashboard() {
     const agentTodayShifts = todayShifts.filter(s => s.agentId === agent.id);
     let baseHours = 0, activeHours = 0, overtimeHours = 0, releasedHours = 0;
     for (const s of agentTodayShifts) {
-      const base   = s.endUtc - s.startUtc;
-      const ls     = leverState[s.id];
-      const active = ls ? ls.activeEnd - ls.activeStart : base;
+      const base = hoursBetweenUtc(s.startUtc, s.endUtc);
+      const ls   = leverState[s.id];
+      const active = ls
+        ? hoursBetweenUtc(ls.activeStart, ls.activeEnd)
+        : base;
       baseHours   += base;
       activeHours += active;
       if (active > base) overtimeHours  += active - base;
@@ -155,7 +198,7 @@ export default function Dashboard() {
       const ls = leverState[s.id];
       const start = ls?.activeStart ?? s.startUtc;
       const end   = ls?.activeEnd   ?? s.endUtc;
-      return utcHour >= start && utcHour <= end;
+      return isHourInShift(utcHour, start, end);
     });
   });
 
@@ -500,8 +543,8 @@ function ClockVisualizer({
                 const ls = leverState[shift.id];
                 const as_ = ls?.activeStart ?? shift.startUtc;
                 const ae  = ls?.activeEnd   ?? shift.endUtc;
-                const baseDur = shift.endUtc - shift.startUtc;
-                const actDur  = ae - as_;
+                const baseDur = hoursBetweenUtc(shift.startUtc, shift.endUtc);
+                const actDur  = hoursBetweenUtc(as_, ae);
                 const hasOT   = actDur > baseDur;
                 const hasRel  = actDur < baseDur;
 
@@ -512,7 +555,7 @@ function ClockVisualizer({
                       fill="none" stroke={hexToRgba(agent.color, isVis ? 0.22 : 0.06)}
                       strokeWidth={RING_W}
                     />
-                    {/* Invisible hit area for tooltip — pointer-events:all forces hit-testing on path geometry regardless of opacity */}
+                    {/* Invisible hit area for tooltip */}
                     <path d={describeArc(CX, CY, r, shift.startUtc, shift.endUtc)}
                       fill="none" stroke="white" strokeWidth={RING_W + 6}
                       strokeOpacity={0}
@@ -586,7 +629,7 @@ function ClockVisualizer({
             {formatH(tooltipInfo.shift.startUtc)} – {formatH(tooltipInfo.shift.endUtc)} UTC
           </div>
           <div className="text-muted-foreground text-[10px]">
-            {(tooltipInfo.shift.endUtc - tooltipInfo.shift.startUtc).toFixed(1)}h shift
+            {hoursBetweenUtc(tooltipInfo.shift.startUtc, tooltipInfo.shift.endUtc).toFixed(1)}h shift
           </div>
         </div>
       )}
@@ -627,7 +670,6 @@ function TimelineView({
   const HOURS    = 24;
   const pxPerHr  = CHART_W / HOURS;
 
-  // Hour gridlines
   const gridHours = [0, 3, 6, 9, 12, 15, 18, 21, 24];
 
   return (
@@ -690,17 +732,15 @@ function TimelineView({
                     const ls = leverState[shift.id];
                     const as_ = ls?.activeStart ?? shift.startUtc;
                     const ae  = ls?.activeEnd   ?? shift.endUtc;
-                    const baseDur = shift.endUtc - shift.startUtc;
-                    const actDur  = ae - as_;
+                    const baseDur = hoursBetweenUtc(shift.startUtc, shift.endUtc);
+                    const actDur  = hoursBetweenUtc(as_, ae);
                     const hasOT  = actDur > baseDur;
                     const hasRel = actDur < baseDur;
 
-                    // base bar
                     const baseLeft  = shift.startUtc * pxPerHr;
                     const baseWidth = baseDur * pxPerHr;
-                    // active bar
-                    const actLeft  = as_ * pxPerHr;
-                    const actWidth = actDur * pxPerHr;
+                    const actLeft   = as_ * pxPerHr;
+                    const actWidth  = actDur * pxPerHr;
 
                     return (
                       <g key={shift.id} style={{ position: "absolute", inset: 0 }}>
@@ -826,8 +866,8 @@ function ShiftLever({
 
   const { startUtc, endUtc } = shift;
   const { activeStart, activeEnd } = leverState;
-  const baseDuration   = endUtc - startUtc;
-  const activeDuration = activeEnd - activeStart;
+  const baseDuration   = hoursBetweenUtc(startUtc, endUtc);
+  const activeDuration = hoursBetweenUtc(activeStart, activeEnd);
   const hasOvertime    = activeDuration > baseDuration;
   const hasReleased    = activeDuration < baseDuration;
 
@@ -840,7 +880,6 @@ function ShiftLever({
   const adjustEnd   = (delta: number) => onLeverChange(shift.id, activeStart, Math.max(activeStart + 0.5, Math.min(24, activeEnd + delta)));
   const adjustStart = (delta: number) => onLeverChange(shift.id, Math.max(0, Math.min(activeEnd - 0.5, activeStart + delta)), activeEnd);
 
-  // Draggable bar refs
   const barRef = useRef<HTMLDivElement>(null);
   const dragging = useRef<{ type: "start" | "end" | "move"; startX: number; startVal: number; startEnd: number } | null>(null);
 
@@ -940,7 +979,7 @@ function ShiftLever({
             }}
           />
         )}
-        {/* Drag handles: start (left edge) and end (right edge) */}
+        {/* Drag handles */}
         <div
           className="absolute top-0 bottom-0 w-2 rounded-l-sm hover:opacity-100 opacity-0 bg-white/30 cursor-col-resize z-10"
           style={{ left: `${actLeft}%` }}
@@ -1015,12 +1054,6 @@ function SummaryPanel({ agentSummaries, selectedDay, zeroCoverageHours, peakCove
           );
         })}
       </div>
-      {(totalOvertimeHours > 0 || totalReleasedHours > 0) && (
-        <div className="mt-2 pt-2 border-t border-border">
-          {totalOvertimeHours > 0 && <p className="text-[10px] text-primary">Total overtime: +{totalOvertimeHours.toFixed(1)}h</p>}
-          {totalReleasedHours > 0 && <p className="text-[10px] text-red-400">Total up for grabs: {totalReleasedHours.toFixed(1)}h</p>}
-        </div>
-      )}
     </div>
   );
 }
