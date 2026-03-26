@@ -368,7 +368,7 @@ function ShiftPill({
   const save = () => {
     const s = parseFloat(startH);
     const e = parseFloat(endH);
-    if (!isNaN(s) && !isNaN(e) && e > s) {
+    if (!isNaN(s) && !isNaN(e) && s >= 0 && s < 24 && e >= 0 && e < 24 && s !== e) {
       onUpsert({ agentId, dayOfWeek: dayIdx, startUtc: s, endUtc: e, activeStart: null, activeEnd: null });
     }
     setEditing(false);
